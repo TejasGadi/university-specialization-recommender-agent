@@ -1,11 +1,17 @@
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pydantic import BaseModel
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+from langchain.schema import HumanMessage, AIMessage
+import json
 
 from ..models.student_profile import StudentProfile
 from ..utils.cache import Cache
 from ..utils.rate_limiter import RateLimiter
+from ..engines.fallback_recommendation_engine import FallbackRecommendationEngine
 from ..engines.recommendation_engine import RecommendationEngine
 from ..engines.career_path_engine import CareerPathEngine
 from ..extractors.profile_extractor import ProfileExtractor
@@ -13,12 +19,18 @@ from config import get_settings
 
 settings = get_settings()
 
+class Message(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: datetime = datetime.now()
+
 class ConversationState(BaseModel):
     stage: str = "welcome"  # welcome, profile_collection, recommendation, career_paths
     profile: Optional[StudentProfile] = None
     last_interaction: datetime = datetime.now()
     recommendations: Optional[list] = None
     selected_specialization: Optional[str] = None
+    chat_history: List[Message] = []  # Add chat history
 
 class ConversationManager:
     def __init__(self):
@@ -26,8 +38,14 @@ class ConversationManager:
         self.rate_limiter = RateLimiter()
         self.states: Dict[str, ConversationState] = {}
         self.profile_extractor = ProfileExtractor()
+        self.fallback_recommendation_engine = FallbackRecommendationEngine()
         self.recommendation_engine = RecommendationEngine()
         self.career_path_engine = CareerPathEngine()
+        self.chat_model = ChatOpenAI(
+            model=settings.LLM_MODEL,
+            temperature=0.7,
+            api_key=settings.OPENAI_API_KEY
+        )
     
     async def process_message(self, session_id: str, message: str) -> str:
         """Process incoming message and return response within time constraint"""
@@ -38,10 +56,15 @@ class ConversationManager:
             # Get or create conversation state
             state = self.states.get(session_id, ConversationState())
             
+            # Add user message to chat history
+            state.chat_history.append(Message(role="user", content=message))
+            
             # Try to get cached response
             cache_key = f"{session_id}:{message}"
             cached_response = await self.cache.get(cache_key)
             if cached_response:
+                # Add cached response to chat history
+                state.chat_history.append(Message(role="assistant", content=cached_response))
                 return cached_response
             
             # Process message with timeout
@@ -49,6 +72,9 @@ class ConversationManager:
                 self._process_message_internal(state, message),
                 timeout=settings.MAX_RESPONSE_TIME
             )
+            
+            # Add assistant response to chat history
+            state.chat_history.append(Message(role="assistant", content=response))
             
             # Update state
             state.last_interaction = datetime.now()
@@ -60,9 +86,13 @@ class ConversationManager:
             return response
             
         except asyncio.TimeoutError:
-            return "I need a moment to process your request. Could you please repeat or simplify your question?"
+            error_msg = "I need a moment to process your request. Could you please repeat or simplify your question?"
+            state.chat_history.append(Message(role="assistant", content=error_msg))
+            return error_msg
         except Exception as e:
-            return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
+            error_msg = f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
+            state.chat_history.append(Message(role="assistant", content=error_msg))
+            return error_msg
     
     async def _process_message_internal(self, state: ConversationState, message: str) -> str:
         """Internal message processing logic based on conversation stage"""
@@ -78,23 +108,24 @@ class ConversationManager:
             state.profile = updated_profile
             
             # Check if profile is complete
-            if updated_profile.completion_percentage() >= 80:
+            if updated_profile.completion_percentage() >= 95:
                 missing_fields = updated_profile.get_missing_fields()
                 if not missing_fields:
                     state.stage = "recommendation"
                     return await self._generate_profile_summary(updated_profile)
             
-            # Ask for missing information
-            return await self._generate_next_question(updated_profile)
+            # Generate dynamic question
+            return await self._generate_dynamic_question(state)
         
         elif state.stage == "recommendation":
             if "yes" in message.lower() or "correct" in message.lower():
-                # Generate recommendations
-                state.recommendations = await self.recommendation_engine.generate_recommendations(state.profile)
+                # Generate recommendations with chat context
+                recommendations = await self._generate_recommendations_with_context(state)
+                state.recommendations = recommendations
                 state.stage = "career_paths"
-                return await self._format_recommendations(state.recommendations)
+                return await self._format_recommendations(recommendations)
             else:
-                return "What information would you like to update in your profile?"
+                return await self._generate_dynamic_question(state)
         
         elif state.stage == "career_paths":
             return await self._process_career_path_request(state, message)
@@ -187,6 +218,49 @@ class ConversationManager:
             except Exception as e:
                 print(f"Error updating profile: {str(e)}")
                 return profile
+    
+    async def _generate_dynamic_question(self, state: ConversationState) -> str:
+        """Generate dynamic questions based on conversation context and profile state"""
+        # Convert chat history to LangChain message format
+        messages = []
+        for msg in state.chat_history[-5:]:  # Use last 5 messages for context
+            if msg.role == "user":
+                messages.append(HumanMessage(content=msg.content))
+            else:
+                messages.append(AIMessage(content=msg.content))
+                
+        # Create system prompt
+        system_prompt = f"""You are a university specialization advisor having a conversation with a student.
+Current Profile State:
+- Name: {state.profile.name if state.profile else 'Not provided'}
+- Academic Level: {state.profile.academic_level if state.profile else 'Not provided'}
+- Subjects: {', '.join(s.name for s in state.profile.subjects) if state.profile and state.profile.subjects else 'Not provided'}
+- Interests: {', '.join(state.profile.interests) if state.profile and state.profile.interests else 'Not provided'}
+- Certifications: {', '.join(state.profile.certifications) if state.profile and state.profile.certifications else 'Not provided'}
+- Extracurriculars: {', '.join(state.profile.extracurriculars) if state.profile and state.profile.extracurriculars else 'Not provided'}
+- Career Inclinations: {', '.join(state.profile.career_inclinations) if state.profile and state.profile.career_inclinations else 'Not provided'}
+- Strengths: {', '.join(state.profile.strengths) if state.profile and state.profile.strengths else 'Not provided'}
+
+Missing Information: {', '.join(state.profile.get_missing_fields()) if state.profile else 'All fields'}
+
+Instructions:
+1. Ask natural follow-up questions to gather missing information
+2. Reference previous answers in your questions
+3. Make connections between shared interests and potential academic paths
+4. Keep responses conversational but focused on gathering profile information
+5. If all essential information is gathered, ask if they want to see recommendations
+
+Current conversation stage: {state.stage}"""
+
+        messages.insert(0, HumanMessage(content=system_prompt))
+        
+        try:
+            response = await self.chat_model.ainvoke(messages)
+            return response.content
+        except Exception as e:
+            logger.error(f"Error generating dynamic question: {str(e)}")
+            # Fallback to static question generation
+            return await self._generate_next_question(state.profile)
     
     async def _generate_next_question(self, profile: StudentProfile) -> str:
         """Generate next question based on missing profile information"""
@@ -302,4 +376,59 @@ class ConversationManager:
         
         response += "Would you like to explore another specialization or get more details about any of these career paths?"
         
-        return response 
+        return response
+
+    async def _generate_recommendations_with_context(self, state: ConversationState) -> List[Dict]:
+        """Generate recommendations using chat history context"""
+        try:
+            # Prepare messages with chat history context
+            messages = []
+            for msg in state.chat_history[-10:]:  # Use last 10 messages for context
+                if msg.role == "user":
+                    messages.append(HumanMessage(content=msg.content))
+                else:
+                    messages.append(AIMessage(content=msg.content))
+            
+            # Create system prompt for recommendations
+            system_prompt = f"""You are a university specialization advisor. Based on the student's profile and conversation history, 
+            generate 2-3 university specialization recommendations in JSON format.
+
+            Student Profile:
+            {state.profile.dict()}
+
+            Instructions:
+            1. Consider the entire conversation context
+            2. Focus on subjects they perform well in and enjoy
+            3. Account for their stated interests and career goals
+            4. Consider their academic level and any mentioned challenges
+            5. Make connections with their extracurricular activities
+
+            Respond with a JSON array in this format:
+            [
+                {{
+                    "specialization": "Name of Specialization",
+                    "reasoning": "Detailed reasoning based on profile and conversation",
+                    "key_subjects": ["Subject1", "Subject2", "Subject3"],
+                    "career_prospects": ["Career1", "Career2", "Career3"]
+                }}
+            ]"""
+
+            messages.insert(0, HumanMessage(content=system_prompt))
+            
+            # Get recommendation from chat model
+            response = await self.chat_model.ainvoke(messages)
+            
+            # Parse JSON response
+            try:
+                recommendations = json.loads(response.content)
+                if isinstance(recommendations, list):
+                    return recommendations
+            except json.JSONDecodeError:
+                logger.error("Failed to parse recommendations JSON")
+            
+            # Fallback to regular recommendation engine
+            return await self.recommendation_engine.generate_recommendations(state.profile)
+            
+        except Exception as e:
+            logger.error(f"Error generating recommendations with context: {str(e)}")
+            return await self.recommendation_engine.generate_recommendations(state.profile)

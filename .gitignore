@@ -4,3 +4,4 @@ config.py
 /data
 /logs
 *.pyc
+/finetuning_llm_for_recommendation_engine
