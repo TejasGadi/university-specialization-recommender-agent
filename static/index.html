@@ -95,6 +95,29 @@
             color: #e74c3c;
             font-style: italic;
         }
+
+        .typing-indicator {
+            display: none;
+            align-self: flex-start;
+            background: #ecf0f1;
+            padding: 10px 15px;
+            border-radius: 10px;
+            color: #7f8c8d;
+            font-style: italic;
+        }
+
+        .typing-indicator span {
+            display: inline-block;
+            animation: dotty steps(1,end) 1s infinite;
+        }
+
+        @keyframes dotty {
+            0%   { content: ''; }
+            25%  { content: '.'; }
+            50%  { content: '..'; }
+            75%  { content: '...'; }
+            100% { content: ''; }
+        }
     </style>
 </head>
 <body>
@@ -102,10 +125,14 @@
         <div class="chat-header">
             <h2>University Specialization Advisor</h2>
         </div>
-        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-messages" id="chat-messages">
+            <div class="typing-indicator" id="typing-indicator">
+                AI is typing<span>...</span>
+            </div>
+        </div>
         <div class="chat-input">
             <input type="text" id="message-input" placeholder="Type your message...">
-            <button onclick="sendMessage()">Send</button>
+            <button onclick="sendMessage()" id="send-button">Send</button>
         </div>
     </div>
 
@@ -115,10 +142,24 @@
         const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
         const messagesContainer = document.getElementById('chat-messages');
         const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const typingIndicator = document.getElementById('typing-indicator');
 
         ws.onmessage = function(event) {
             const response = JSON.parse(event.data);
-            addMessage(response.content, 'bot');
+            
+            if (response.type === 'status') {
+                if (response.content === 'typing') {
+                    typingIndicator.style.display = 'block';
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                } else if (response.content === 'idle') {
+                    typingIndicator.style.display = 'none';
+                }
+            } else if (response.type === 'message') {
+                addMessage(response.content, 'bot');
+            } else if (response.type === 'error') {
+                addMessage(response.content, 'error');
+            }
         };
 
         ws.onerror = function(error) {
@@ -130,22 +171,36 @@
             messageDiv.classList.add('message');
             messageDiv.classList.add(type + '-message');
             messageDiv.textContent = content;
-            messagesContainer.appendChild(messageDiv);
+            // Insert before typing indicator
+            messagesContainer.insertBefore(messageDiv, typingIndicator);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
 
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (message) {
+            if (message && ws.readyState === WebSocket.OPEN) {
                 addMessage(message, 'user');
                 ws.send(message);
                 messageInput.value = '';
+                // Disable input and button while processing
+                messageInput.disabled = true;
+                sendButton.disabled = true;
             }
         }
 
         messageInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 sendMessage();
+            }
+        });
+
+        // Re-enable input when bot becomes idle
+        ws.addEventListener('message', function(event) {
+            const response = JSON.parse(event.data);
+            if (response.type === 'status' && response.content === 'idle') {
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+                messageInput.focus();
             }
         });
     </script>
