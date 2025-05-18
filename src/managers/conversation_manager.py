@@ -55,34 +55,84 @@ class ConversationManager:
 
             # Get or create conversation state
             state = self.states.get(session_id, ConversationState())
+            if not state:
+                state = ConversationState()
+                self.states[session_id] = state
 
             # Add user message to chat history
             state.chat_history.append(Message(role="user", content=message))
 
-            # Process message with timeout
-            response = await asyncio.wait_for(
-                self._process_message_internal(state, message),
-                timeout=settings.MAX_RESPONSE_TIME
-            )
+            try:
+                # Calculate dynamic timeout based on message length and conversation stage
+                base_timeout = settings.MAX_RESPONSE_TIME
+                
+                # Increase timeout for longer messages
+                if len(message) > 200:
+                    base_timeout *= 1.5
+                if len(message) > 500:
+                    base_timeout *= 1.5
+                    
+                # Increase timeout for profile collection stage
+                if state.stage == "profile_collection":
+                    base_timeout *= 1.5
+                
+                # Process message with calculated timeout
+                response = await asyncio.wait_for(
+                    self._process_message_internal(state, message),
+                    timeout=base_timeout
+                )
 
-            # Add assistant response to chat history
-            state.chat_history.append(Message(role="assistant", content=response))
+                # Add assistant response to chat history
+                state.chat_history.append(Message(role="assistant", content=response))
 
-            # Update state
-            state.last_interaction = datetime.now()
-            self.states[session_id] = state
+                # Update state
+                state.last_interaction = datetime.now()
+                self.states[session_id] = state
 
-            return response
+                return response
 
-        except asyncio.TimeoutError:
-            error_msg = "I need a moment to process your request. Could you please repeat or simplify your question?"
-            state.chat_history.append(Message(role="assistant", content=error_msg))
-            return error_msg
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Request timed out for session {session_id}. "
+                    f"Message length: {len(message)}, Stage: {state.stage}"
+                )
+                
+                # Provide stage-specific timeout messages
+                if state.stage == "profile_collection":
+                    error_msg = (
+                        "I see you're sharing detailed information about your background. "
+                        "Let me help you break this down: Could you first tell me about "
+                        "your current academic level and 2-3 of your favorite subjects?"
+                    )
+                elif state.stage == "recommendation":
+                    error_msg = (
+                        "I need a bit more time to analyze your preferences and generate "
+                        "personalized recommendations. Could you confirm if you want to "
+                        "see recommendations based on your current profile?"
+                    )
+                else:
+                    error_msg = (
+                        "I need a moment to process your detailed response. "
+                        "Could you break it down into smaller parts? "
+                        "Let's tackle one aspect at a time."
+                    )
+                
+                state.chat_history.append(Message(role="assistant", content=error_msg))
+                return error_msg
+
+            except Exception as e:
+                logger.error(f"Error in process_message: {str(e)}", exc_info=True)
+                error_msg = (
+                    "I encountered an issue processing your response. "
+                    "Could you try again with more focused information? "
+                    "For example, tell me about one aspect at a time."
+                )
+                state.chat_history.append(Message(role="assistant", content=error_msg))
+                return error_msg
+
         except Exception as e:
-            logger.error(f"Error in process_message: {str(e)}")
-            error_msg = f"I apologize, but I encountered an error. Please try again."
-            state.chat_history.append(Message(role="assistant", content=error_msg))
-            return error_msg
+            logger.error(f"Critical error in process_message for session {session_id}: {str(e)}", exc_info=True)
+            return "I apologize, but I encountered a system error. Please try again in a moment."
 
     async def _process_message_internal(self, state: ConversationState, message: str) -> str:
         """Enhanced internal message processing with dynamic flow"""
