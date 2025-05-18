@@ -316,43 +316,32 @@ Analyze the message and determine the primary intent. Consider:
             
             # Check if profile is complete enough for recommendations
             if updated_profile.completion_percentage() >= 80:
-                missing_fields = updated_profile.get_missing_fields()
-                if not missing_fields:
-                    # Print profile summary before generating recommendations
-                    profile_summary = await self._generate_profile_summary(updated_profile)
-                    logger.info(f"Profile before recommendations:\n{profile_summary}")
-                    # Generate recommendations immediately if profile is complete
-                    recommendations = await self._generate_recommendations_with_context(state)
-                    state.recommendations = recommendations
-                    return await self._format_recommendations(recommendations)
+                # Generate profile summary and ask for confirmation first
+                profile_summary = await self._generate_profile_summary(updated_profile)
+                logger.info(f"Profile before recommendations:\n{profile_summary}")
+                state.stage = "recommendation"  # Change stage to recommendation
+                return profile_summary
             
             # Generate dynamic question to gather more information
             return await self._generate_dynamic_question(state)
             
         elif state.stage == "recommendation":
             # Check if user confirms profile summary
-            if "yes" in message.lower() or "correct" in message.lower() or intent == "confirm":
-                # Print profile summary before generating recommendations
-                profile_summary = await self._generate_profile_summary(state.profile)
-                logger.info(f"Profile before recommendations:\n{profile_summary}")
+            if intent == "confirm" or "yes" in message.lower() or "correct" in message.lower():
                 # Generate recommendations with chat context
                 recommendations = await self._generate_recommendations_with_context(state)
                 state.recommendations = recommendations
                 return await self._format_recommendations(recommendations)
             elif intent == "reject" or "no" in message.lower() or "incorrect" in message.lower():
                 # User indicates profile summary is incorrect
+                state.stage = "profile_collection"  # Go back to profile collection
                 return "Let's update your profile information. What would you like to change?"
             else:
-                # Process as additional profile information
-                updated_profile = await self._update_profile(state.profile, message)
-                state.profile = updated_profile
-                # Print profile summary before generating recommendations
-                profile_summary = await self._generate_profile_summary(updated_profile)
-                logger.info(f"Profile before recommendations:\n{profile_summary}")
-                # Generate recommendations with updated profile
-                recommendations = await self._generate_recommendations_with_context(state)
-                state.recommendations = recommendations
-                return await self._format_recommendations(recommendations)
+                # If user wants to explore career paths for a recommendation
+                if "career path" in message.lower() or "explore" in message.lower():
+                    return await self._process_career_path_request(state, message)
+                # For other cases, ask for confirmation
+                return "Would you like to confirm your profile information first? Please say 'yes' to see recommendations or 'no' to make changes."
                 
         elif state.stage == "career_paths":
             # Check if user is asking about a different specialization
@@ -396,29 +385,37 @@ Analyze the message and determine the primary intent. Consider:
         # Default fallback
         return "general_question"
 
-    async def _extract_specialization_mention(self, message: str, recommendations: List[Specialization]) -> Optional[str]:
+    async def _extract_specialization_mention(self, message: str, recommendations) -> Optional[str]:
         """Extract which specialization the user is interested in exploring"""
         try:
-            # Try to parse by number
-            for i in range(1, len(recommendations) + 1):
-                if str(i) in message:
-                    return recommendations[i-1].specialization
-            
-            # Try to match by name
-            for rec in recommendations:
-                if rec.specialization.lower() in message.lower():
-                    return rec.specialization
-            
+            # # Handle case where recommendations is a string
+            # if isinstance(recommendations, str):
+            #     # Extract specialization from the recommendation string
+            #     if "Recommended Specialization:" in recommendations:
+            #         spec_line = [line for line in recommendations.split('\n') if "Recommended Specialization:" in line][0]
+            #         return spec_line.split("Recommended Specialization:")[1].strip()
+            #     return None
+
+            # # Try to match by name for object recommendations
+            # for rec in recommendations:
+            #     if isinstance(rec, Specialization):
+            #         if rec.specialization.lower() in message.lower():
+            #             return rec.specialization
+                
             # Use LLM to find the specialization if direct matching fails
-            system_prompt = """The user is responding to a list of specialization recommendations. 
+            system_prompt = f"""The user is responding to a list of specialization recommendations. 
             Determine which specialization they are referring to in their message.
             
             Available specializations:
-            {}
+            {recommendations}
             
             Return a structured response indicating the specialization name and your confidence in the extraction."""
             
-            spec_list = "\n".join([f"{i+1}. {rec.specialization}" for i, rec in enumerate(recommendations)])
+            if isinstance(recommendations, list):
+                spec_list = "\n".join([f"{i+1}. {rec.specialization}" for i, rec in enumerate(recommendations) if isinstance(rec, Specialization)])
+            else:
+                spec_list = recommendations
+                
             prompt = system_prompt.format(spec_list)
             
             messages = [
@@ -426,17 +423,9 @@ Analyze the message and determine the primary intent. Consider:
                 HumanMessage(content=message)
             ]
             
-            # Use structured output for specialization extraction
-            structured_llm = self.chat_model.with_structured_output(SpecializationExtraction)
-            result: SpecializationExtraction = await structured_llm.ainvoke(messages)
+            result = await self.chat_model.ainvoke(messages)
             
-            if result.specialization and result.confidence > 0.7:
-                # Verify the extracted specialization exists in recommendations
-                for rec in recommendations:
-                    if rec.specialization.lower() == result.specialization.lower():
-                        return rec.specialization
-            
-            return None
+            return result.content
             
         except Exception as e:
             logger.error(f"Error extracting specialization: {str(e)}")
@@ -638,7 +627,7 @@ Interests: {', '.join(profile.interests)}
     async def _format_recommendations(self, recommendations) -> str:
         """Format recommendations for user presentation"""
         if isinstance(recommendations, str):
-            recommendations += "/nWhich specialization would you like to explore further? (Respond with the number or name, or ask me about career paths for any of these options)"
+            recommendations += "/Do you want to explore the specializations further? (Respond with the name, or ask me about career paths in this specialization)"
             return recommendations
         if not recommendations:
             return "I apologize, but I couldn't generate any recommendations at this time. Please try again."
@@ -658,60 +647,63 @@ Interests: {', '.join(profile.interests)}
     async def _process_career_path_request(self, state: ConversationState, message: str) -> str:
         """Process career path exploration request - enhanced to handle both string message and direct specialization"""
         try:
+            logger.info(f"Processing career path request for message: {message}")
+            logger.info(f"Current recommendations type: {type(state.recommendations)}")
+            logger.info(f"Current recommendations: {state.recommendations}")
+            
             # If message is a direct specialization name
-            if isinstance(message, str) and any(rec.specialization == message for rec in state.recommendations):
-                specialization = message
+            if isinstance(state.recommendations, list):
+                if any(isinstance(rec, Specialization) and rec.specialization == message for rec in state.recommendations):
+                    specialization = message
+                else:
+                    # Try to extract which specialization the user wants to explore
+                    specialization = await self._extract_specialization_mention(message, state.recommendations)
             else:
-                # Try to extract which specialization the user wants to explore
+                # Handle string recommendations
                 specialization = await self._extract_specialization_mention(message, state.recommendations)
-                if not specialization:
-                    return "I'm not sure which specialization you're interested in. Could you specify by number (1, 2, etc.) or name?"
+                
+            if not specialization:
+                logger.info("No specialization could be extracted from the message")
+                return "I'm not sure which specialization you're interested in. Could you specify by name which specialization you'd like to explore?"
 
+            logger.info(f"Extracted specialization: {specialization}")
+            
             # Update selected specialization in state
             state.selected_specialization = specialization
             
-            # Create system prompt for career paths
-            system_prompt = f"""You are a university specialization advisor providing career path information.
-            Generate detailed career paths for the {specialization} specialization.
-            Consider the student's profile and interests when describing the paths.
-            
-            Student Profile:
-            {state.profile.dict()}
-            
-            Each career path must include:
-            - A specific career path name
-            - Detailed description of the role and responsibilities
-            - Required skills and competencies
-            - Typical career progression
-            - Required education and qualifications"""
-            
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"What are the career paths for {specialization}?")
-            ]
-            
-            # Get career paths using structured output
-            structured_llm = self.chat_model.with_structured_output(CareerPathList)
-            result: CareerPathList = await structured_llm.ainvoke(messages)
-            
-            # Format response
-            response = f"Here are some promising career paths for {specialization}:\n\n"
+            try:
+                # Create system prompt for career paths
+                system_prompt = f"""You are a university specialization advisor providing career path information.
+                Generate detailed career paths for the {specialization} specialization.
+                
+                Each career path must include:
+                - A specific career path name
+                - Detailed description of the role and responsibilities
+                - Required skills and competencies
+                - Typical career progression
+                - Required education and qualifications"""
+                
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=f"What are the career paths for {specialization}?")
+                ]
+                
+                # Get career paths using structured output
+                response = await self.chat_model.ainvoke(messages)
 
-            for path in result.career_paths:
-                response += f"• {path.career_path}\n"
-                response += f"  Description: {path.description}\n"
-                response += f"  Required Skills: {', '.join(path.required_skills)}\n"
-                response += f"  Career Progression: {path.progression}\n"
-                response += f"  Required Education: {', '.join(path.education)}\n\n"
+                response = response.content
+                
+                response += "Would you like to explore another specialization, get more details about any of these career paths, or update your profile information?"
 
-            response += "Would you like to explore another specialization, get more details about any of these career paths, or update your profile information?"
-
-            return response
+                return response
+                
+            except Exception as inner_e:
+                logger.error(f"Error generating career paths: {str(inner_e)}", exc_info=True)
+                return f"I understand you're interested in {specialization}, but I encountered an issue generating the career paths. Would you like to try exploring a different specialization?"
             
         except Exception as e:
-            logger.error(f"Error processing career path request: {str(e)}")
+            logger.error(f"Error processing career path request: {str(e)}", exc_info=True)
             return "I apologize, but I had trouble processing your request for career paths. Could you please specify which specialization you're interested in?"
-
 
     async def _generate_recommendations_with_context(self, state: ConversationState):
         """Generate recommendations using chat history context by calling an external API"""
@@ -727,61 +719,78 @@ Interests: {', '.join(profile.interests)}
                 logger.info(f"Missing optional fields: {optional_missing}")
 
             def format_profile(profile):
-                subjects_text = []
-                for subj in profile.subjects:
-                    fav = " and is a favorite subject" if subj.is_favorite else ""
-                    subjects_text.append(
-                        f"{subj.name} ({subj.level}) with a grade of {subj.grade}{fav}"
+                try:
+                    subjects_text = []
+                    for subj in profile.subjects:
+                        fav = " and is a favorite subject" if subj.is_favorite else ""
+                        subjects_text.append(
+                            f"{subj.name} ({subj.level}) with a grade of {subj.grade}{fav}"
+                        )
+                    subjects_str = "; ".join(subjects_text)
+
+                    interests = ", ".join(profile.interests or [])
+                    certifications = ", ".join(profile.certifications or [])
+                    extracurriculars = ", ".join(profile.extracurriculars or [])
+                    strengths = ", ".join(profile.strengths or [])
+                    challenges = ", ".join(profile.challenges or [])
+                    career_inclinations = ", ".join(profile.career_inclinations or [])
+
+                    input_text = (
+                        f"{profile.name} is a {profile.age}-year-old {profile.academic_level.replace('_', ' ').title()} student. "
+                        f"They have studied subjects such as {subjects_str}. "
+                        f"Their interests include {interests}. "
+                        f"They hold certifications in {certifications}. "
+                        f"In addition, they have participated in extracurricular activities such as {extracurriculars}. "
+                        f"Some of their strengths are {strengths}, while they face challenges in {challenges}. "
+                        f"Their career inclinations include {career_inclinations}."
                     )
-                subjects_str = "; ".join(subjects_text)
-
-                interests = ", ".join(profile.interests or [])
-                certifications = ", ".join(profile.certifications or [])
-                extracurriculars = ", ".join(profile.extracurriculars or [])
-                strengths = ", ".join(profile.strengths or [])
-                challenges = ", ".join(profile.challenges or [])
-                career_inclinations = ", ".join(profile.career_inclinations or [])
-
-                input_text = (
-                    f"{profile.name} is a {profile.age}-year-old {profile.academic_level.replace('_', ' ').title()} student. "
-                    f"They have studied subjects such as {subjects_str}. "
-                    f"Their interests include {interests}. "
-                    f"They hold certifications in {certifications}. "
-                    f"In addition, they have participated in extracurricular activities such as {extracurriculars}. "
-                    f"Some of their strengths are {strengths}, while they face challenges in {challenges}. "
-                    f"Their career inclinations include {career_inclinations}."
-                )
-                return input_text
+                    logger.info(f"Formatted profile text:\n{input_text}")
+                    return input_text
+                except Exception as e:
+                    logger.error(f"Error formatting profile: {str(e)}", exc_info=True)
+                    raise
 
             input_text = format_profile(state.profile)
 
             payload = {
                 "instruction": (
-                    "You are a career counselor. Analyze the student's profile and recommend suitable university "
+                    "You are a college/university specialization recommender. Analyze the student's profile and recommend suitable university "
                     "specializations, with reasons and career prospects."
                 ),
                 "input_text": input_text,
                 "max_new_tokens": 256
             }
 
-            api_url = "https://73u3bblz7bly3o-8000.proxy.runpod.net/generate"  # Replace with actual API URL
+            logger.info(f"Sending API request with payload:\n{payload}")
+            api_url = "https://73u3bblz7bly3o-8000.proxy.runpod.net/generate"
 
             async with httpx.AsyncClient() as client:
-                response = await client.post(api_url, json=payload)
+                try:
+                    response = await client.post(api_url, json=payload)
+                    logger.info(f"API Response status: {response.status_code}")
+                    logger.info(f"API Response headers: {response.headers}")
+                    logger.info(f"API Response body: {response.text}")
 
-            if response.status_code == 200:
-                recommendation_text = response.text.strip().strip('"')  # Strip quotes if API wraps string
-                logger.info(f"API Response: {recommendation_text}")
-                return recommendation_text
-            else:
-                logger.error(f"API call failed with status code {response.status_code}: {response.text}")
-                raise Exception("API call failed")
+                    if response.status_code == 200:
+                        recommendation_text = response.text.strip().strip('"')
+                        logger.info(f"Processed API Response: {recommendation_text}")
+                        return recommendation_text
+                    else:
+                        logger.error(f"API call failed with status code {response.status_code}: {response.text}")
+                        raise Exception(f"API call failed with status {response.status_code}: {response.text}")
+                except httpx.RequestError as e:
+                    logger.error(f"HTTP Request failed: {str(e)}", exc_info=True)
+                    raise
+                except Exception as e:
+                    logger.error(f"Error during API call: {str(e)}", exc_info=True)
+                    raise
 
         except Exception as e:
-            logger.error(f"Error generating recommendations with context: {e}")
+            logger.error(f"Error generating recommendations with context: {str(e)}", exc_info=True)
+            # Fall back to local recommendation engine
+            logger.info("Falling back to local recommendation engine")
             fallback_recs = await self.fallback_recommendation_engine.generate_recommendations(state.profile)
             return [Specialization(**rec) for rec in fallback_recs]
-
 
     async def _generate_dynamic_response(self, state: ConversationState, message: str) -> str:
         """Generate dynamic conversational response when we can't categorize the message"""
