@@ -1,4 +1,5 @@
 import asyncio
+import httpx
 from typing import Optional, Dict, Any, List, Tuple, Literal
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -288,18 +289,14 @@ Analyze the message and determine the primary intent. Consider:
             
         elif intent == "request_recommendations" and confidence > 0.7:
             # User explicitly wants recommendations from any stage
-            if state.profile and state.profile.completion_percentage() >= 70:
-                state.stage = "recommendation"
-                # Print profile summary before generating recommendations
+            if state.profile and state.profile.completion_percentage() >= 80:
+                # Generate profile summary and ask for confirmation
                 profile_summary = await self._generate_profile_summary(state.profile)
                 logger.info(f"Profile before recommendations:\n{profile_summary}")
-                # Generate recommendations immediately if profile is complete enough
-                recommendations = await self._generate_recommendations_with_context(state)
-                state.recommendations = recommendations
-                return await self._format_recommendations(recommendations)
-            else:
-                # Not enough profile info to generate recommendations
-                return await self._generate_dynamic_question(state)
+                return profile_summary
+                
+            # Generate dynamic question to gather more information
+            return await self._generate_dynamic_question(state)
                 
         elif intent == "explore_career_paths" and confidence > 0.7 and state.recommendations:
             # User wants to explore career paths for a specialization
@@ -318,7 +315,7 @@ Analyze the message and determine the primary intent. Consider:
             state.profile = updated_profile
             
             # Check if profile is complete enough for recommendations
-            if updated_profile.completion_percentage() >= 95:
+            if updated_profile.completion_percentage() >= 80:
                 missing_fields = updated_profile.get_missing_fields()
                 if not missing_fields:
                     # Print profile summary before generating recommendations
@@ -638,8 +635,11 @@ Interests: {', '.join(profile.interests)}
 
         return summary
 
-    async def _format_recommendations(self, recommendations: List[Specialization]) -> str:
+    async def _format_recommendations(self, recommendations) -> str:
         """Format recommendations for user presentation"""
+        if isinstance(recommendations, str):
+            recommendations += "/nWhich specialization would you like to explore further? (Respond with the number or name, or ask me about career paths for any of these options)"
+            return recommendations
         if not recommendations:
             return "I apologize, but I couldn't generate any recommendations at this time. Please try again."
 
@@ -712,17 +712,13 @@ Interests: {', '.join(profile.interests)}
             logger.error(f"Error processing career path request: {str(e)}")
             return "I apologize, but I had trouble processing your request for career paths. Could you please specify which specialization you're interested in?"
 
-    async def _generate_recommendations_with_context(self, state: ConversationState) -> List[Specialization]:
-        """Generate recommendations using chat history context"""
+
+    async def _generate_recommendations_with_context(self, state: ConversationState):
+        """Generate recommendations using chat history context by calling an external API"""
         try:
-            # Print detailed profile information before generating recommendations
             logger.info(f"Generating recommendations for profile:\n{state.profile.dict()}")
-            
-            # Calculate and log profile completion percentage
             completion = self.calculate_profile_completion(state)
             logger.info(f"Profile completion: {completion}%")
-            
-            # Log missing fields
             required_missing = self.get_missing_required_fields(state)
             optional_missing = self.get_missing_optional_fields(state)
             if required_missing:
@@ -730,49 +726,62 @@ Interests: {', '.join(profile.interests)}
             if optional_missing:
                 logger.info(f"Missing optional fields: {optional_missing}")
 
-            # Prepare messages with chat history context
-            messages = []
-            for msg in state.chat_history[-10:]:  # Use last 10 messages for context
-                if msg.role == "user":
-                    messages.append(HumanMessage(content=msg.content))
-                else:
-                    messages.append(AIMessage(content=msg.content))
+            def format_profile(profile):
+                subjects_text = []
+                for subj in profile.subjects:
+                    fav = " and is a favorite subject" if subj.is_favorite else ""
+                    subjects_text.append(
+                        f"{subj.name} ({subj.level}) with a grade of {subj.grade}{fav}"
+                    )
+                subjects_str = "; ".join(subjects_text)
 
-            # Create system prompt for recommendations
-            system_prompt = f"""You are a university specialization advisor. Based on the student's profile and conversation history, 
-            generate 3-4 university specialization recommendations.
-            
-            Student Profile:
-            {state.profile.dict()}
-            
-            Instructions:
-            1. Consider the entire conversation context
-            2. Focus on subjects they perform well in and enjoy
-            3. Account for their stated interests and career goals
-            4. Consider their academic level and any mentioned challenges
-            5. Make connections with their extracurricular activities
-            6. Be specific with specializations - provide concrete degree programs, not general fields
-            
-            Each recommendation must include:
-            - A specific specialization name
-            - Detailed reasoning based on the student's profile
-            - List of key subjects required for the specialization
-            - List of potential career prospects"""
-            
-            messages.insert(0, SystemMessage(content=system_prompt))
+                interests = ", ".join(profile.interests or [])
+                certifications = ", ".join(profile.certifications or [])
+                extracurriculars = ", ".join(profile.extracurriculars or [])
+                strengths = ", ".join(profile.strengths or [])
+                challenges = ", ".join(profile.challenges or [])
+                career_inclinations = ", ".join(profile.career_inclinations or [])
 
-            # Get recommendations using structured output
-            structured_llm = self.chat_model.with_structured_output(RecommendationList)
-            result: RecommendationList = await structured_llm.ainvoke(messages)
-            
-            return result.recommendations
+                input_text = (
+                    f"{profile.name} is a {profile.age}-year-old {profile.academic_level.replace('_', ' ').title()} student. "
+                    f"They have studied subjects such as {subjects_str}. "
+                    f"Their interests include {interests}. "
+                    f"They hold certifications in {certifications}. "
+                    f"In addition, they have participated in extracurricular activities such as {extracurriculars}. "
+                    f"Some of their strengths are {strengths}, while they face challenges in {challenges}. "
+                    f"Their career inclinations include {career_inclinations}."
+                )
+                return input_text
+
+            input_text = format_profile(state.profile)
+
+            payload = {
+                "instruction": (
+                    "You are a career counselor. Analyze the student's profile and recommend suitable university "
+                    "specializations, with reasons and career prospects."
+                ),
+                "input_text": input_text,
+                "max_new_tokens": 256
+            }
+
+            api_url = "https://73u3bblz7bly3o-8000.proxy.runpod.net/generate"  # Replace with actual API URL
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(api_url, json=payload)
+
+            if response.status_code == 200:
+                recommendation_text = response.text.strip().strip('"')  # Strip quotes if API wraps string
+                logger.info(f"API Response: {recommendation_text}")
+                return recommendation_text
+            else:
+                logger.error(f"API call failed with status code {response.status_code}: {response.text}")
+                raise Exception("API call failed")
 
         except Exception as e:
-            logger.error(f"Error generating recommendations with context: {str(e)}")
-            # Fallback to regular recommendation engine
+            logger.error(f"Error generating recommendations with context: {e}")
             fallback_recs = await self.fallback_recommendation_engine.generate_recommendations(state.profile)
-            # Convert fallback recommendations to Specialization objects
             return [Specialization(**rec) for rec in fallback_recs]
+
 
     async def _generate_dynamic_response(self, state: ConversationState, message: str) -> str:
         """Generate dynamic conversational response when we can't categorize the message"""
