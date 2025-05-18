@@ -1,13 +1,14 @@
 import asyncio
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Literal
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 import json
-from ..models.student_profile import StudentProfile
+from ..models.student_profile import StudentProfile, Subject
 from ..utils.rate_limiter import RateLimiter
 from ..engines.fallback_recommendation_engine import FallbackRecommendationEngine
 from ..engines.recommendation_engine import RecommendationEngine
@@ -15,6 +16,8 @@ from ..engines.career_path_engine import CareerPathEngine
 from ..extractors.profile_extractor import ProfileExtractor
 from config import get_settings
 import logging
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.output_parsers import PydanticOutputParser
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -24,11 +27,53 @@ class Message(BaseModel):
     content: str
     timestamp: datetime = datetime.now()
 
+class IntentDetectionResult(BaseModel):
+    intent: Literal[
+        "update_profile",
+        "request_recommendations",
+        "explore_career_paths",
+        "confirm",
+        "reject",
+        "change_specialization",
+        "request_more_recommendations",
+        "general_question"
+    ] = Field(...)
+    
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+class Specialization(BaseModel):
+    """Pydantic model for specialization recommendation"""
+    specialization: str = Field(..., description="Name of the specialization")
+    reasoning: str = Field(..., description="Detailed reasoning based on profile and conversation")
+    key_subjects: List[str] = Field(..., description="List of key subjects for this specialization")
+    career_prospects: List[str] = Field(..., description="List of potential career paths")
+
+class RecommendationList(BaseModel):
+    """Pydantic model for list of specialization recommendations"""
+    recommendations: List[Specialization] = Field(..., min_items=1, max_items=5)
+
+class CareerPath(BaseModel):
+    """Pydantic model for career path information"""
+    career_path: str = Field(..., description="Name of the career path")
+    description: str = Field(..., description="Detailed description of the career path")
+    required_skills: List[str] = Field(..., description="List of required skills")
+    progression: str = Field(..., description="Career progression path")
+    education: List[str] = Field(..., description="Required education and qualifications")
+
+class CareerPathList(BaseModel):
+    """Pydantic model for list of career paths"""
+    career_paths: List[CareerPath] = Field(..., min_items=1, max_items=5)
+
+class SpecializationExtraction(BaseModel):
+    """Pydantic model for specialization extraction result"""
+    specialization: Optional[str] = Field(None, description="Extracted specialization name or None if not found")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in the extraction")
+
 class ConversationState(BaseModel):
     stage: str = "welcome"  # welcome, profile_collection, recommendation, career_paths
     profile: Optional[StudentProfile] = None
     last_interaction: datetime = datetime.now()
-    recommendations: Optional[list] = None
+    recommendations: Optional[List[Specialization]] = None
     selected_specialization: Optional[str] = None
     chat_history: List[Message] = []  # Add chat history
     intent: Optional[str] = None  # Store detected intent for context
@@ -46,6 +91,81 @@ class ConversationManager:
             temperature=0.7,
             api_key=settings.OPENAI_API_KEY
         )
+        
+        # Initialize intent detection chain
+        self.intent_parser = PydanticOutputParser(pydantic_object=IntentDetectionResult)
+        self.intent_prompt = ChatPromptTemplate.from_messages([
+            ("system", '''You are an AI assistant analyzing user intent in a conversation with a university specialization advisor.
+Your task is to determine the user's primary intent from their message.
+
+Current conversation stage: {stage}
+Profile completion: {profile_completion}%
+
+Available intents:
+1. update_profile - User is providing or updating their profile information
+2. request_recommendations - User wants to see specialization recommendations
+3. explore_career_paths - User wants to explore career paths for a specialization
+4. confirm - User is confirming or agreeing with something
+5. reject - User is rejecting or disagreeing with something
+6. change_specialization - User wants to explore a different specialization
+7. request_more_recommendations - User wants more specialization options
+8. general_question - Default for general queries or unclear intent
+
+Analyze the message and determine the primary intent. Consider:
+- The current conversation stage
+- The message content and context
+- Any explicit or implicit requests
+- The natural flow of academic advising
+
+{format_instructions}'''),
+            ("human", "{message}")
+        ])
+        
+        # Create the QA chain for intent detection
+        self.intent_chain = (
+            RunnablePassthrough() 
+            | self._get_intent_context 
+            | self.intent_prompt 
+            | self.chat_model 
+            | self.intent_parser
+        )
+
+    def _get_intent_context(self, input_dict: Dict) -> Dict:
+        """Prepare context for intent detection"""
+        state = input_dict["state"]
+        message = input_dict["message"]
+        
+        # Get profile completion
+        profile_completion = state.profile.completion_percentage() if state.profile else 0
+        
+        return {
+            "stage": state.stage,
+            "profile_completion": profile_completion,
+            "message": message,
+            "format_instructions": self.intent_parser.get_format_instructions()
+        }
+
+    async def _detect_intent(self, state: ConversationState, message: str) -> Tuple[str, float]:
+        """Detect user intent using a QA chain"""
+        try:
+            # Prepare input for the chain
+            chain_input = {
+                "state": state,
+                "message": message
+            }
+            
+            # Run the chain
+            result = await self.intent_chain.ainvoke(chain_input)
+            
+            # Log the successful intent detection
+            logger.info(f"Intent detection result: {result.dict()}")
+            return result.intent, result.confidence
+            
+        except Exception as e:
+            logger.error(f"Intent detection failed: {str(e)}", exc_info=True)
+            # Determine a more appropriate fallback intent based on the message content
+            fallback_intent = self._determine_fallback_intent(message, state)
+            return fallback_intent, 0.5
 
     async def _stream_response(self, text: str, websocket) -> None:
         """Helper method to stream response to the websocket with improved error handling"""
@@ -170,6 +290,9 @@ class ConversationManager:
             # User explicitly wants recommendations from any stage
             if state.profile and state.profile.completion_percentage() >= 70:
                 state.stage = "recommendation"
+                # Print profile summary before generating recommendations
+                profile_summary = await self._generate_profile_summary(state.profile)
+                logger.info(f"Profile before recommendations:\n{profile_summary}")
                 # Generate recommendations immediately if profile is complete enough
                 recommendations = await self._generate_recommendations_with_context(state)
                 state.recommendations = recommendations
@@ -198,6 +321,9 @@ class ConversationManager:
             if updated_profile.completion_percentage() >= 95:
                 missing_fields = updated_profile.get_missing_fields()
                 if not missing_fields:
+                    # Print profile summary before generating recommendations
+                    profile_summary = await self._generate_profile_summary(updated_profile)
+                    logger.info(f"Profile before recommendations:\n{profile_summary}")
                     # Generate recommendations immediately if profile is complete
                     recommendations = await self._generate_recommendations_with_context(state)
                     state.recommendations = recommendations
@@ -209,6 +335,9 @@ class ConversationManager:
         elif state.stage == "recommendation":
             # Check if user confirms profile summary
             if "yes" in message.lower() or "correct" in message.lower() or intent == "confirm":
+                # Print profile summary before generating recommendations
+                profile_summary = await self._generate_profile_summary(state.profile)
+                logger.info(f"Profile before recommendations:\n{profile_summary}")
                 # Generate recommendations with chat context
                 recommendations = await self._generate_recommendations_with_context(state)
                 state.recommendations = recommendations
@@ -220,6 +349,9 @@ class ConversationManager:
                 # Process as additional profile information
                 updated_profile = await self._update_profile(state.profile, message)
                 state.profile = updated_profile
+                # Print profile summary before generating recommendations
+                profile_summary = await self._generate_profile_summary(updated_profile)
+                logger.info(f"Profile before recommendations:\n{profile_summary}")
                 # Generate recommendations with updated profile
                 recommendations = await self._generate_recommendations_with_context(state)
                 state.recommendations = recommendations
@@ -242,79 +374,54 @@ class ConversationManager:
         # Fallback - use dynamic response generation
         return await self._generate_dynamic_response(state, message)
 
-    async def _detect_intent(self, state: ConversationState, message: str) -> Tuple[str, float]:
-        """Detect user intent to enable dynamic conversation flow"""
+    def _determine_fallback_intent(self, message: str, state: ConversationState) -> str:
+        """Determine a fallback intent based on message content and conversation state"""
+        message_lower = message.lower()
         
-        # Create system prompt for intent detection
-        system_prompt = """You are an AI assistant analyzing user intent in a conversation with a university specialization advisor.
-        Analyze the message and determine the primary intent. Respond with a JSON object containing:
-        1. "intent": One of the following intents:
-           - "update_profile" (user is sharing personal information or updating profile)
-           - "request_recommendations" (user wants specialization recommendations)
-           - "explore_career_paths" (user wants to explore career paths for a specialization)
-           - "confirm" (user is confirming or agreeing with something)
-           - "reject" (user is rejecting or disagreeing with something)
-           - "change_specialization" (user wants to explore a different specialization)
-           - "request_more_recommendations" (user wants additional specialization options)
-           - "general_question" (user is asking a general question)
-        2. "confidence": A float value between 0.0 and 1.0 indicating confidence in the intent detection
-        
-        Current conversation stage: {stage}
-        User profile completion: {profile_completion}%
-        """
-        
-        profile_completion = state.profile.completion_percentage() if state.profile else 0
-        prompt = system_prompt.format(stage=state.stage, profile_completion=profile_completion)
-        
-        try:
-            # Get recent conversation history for context
-            messages = [SystemMessage(content=prompt)]
-            for msg in state.chat_history[-5:]:  # Last 5 messages
-                if msg.role == "user":
-                    messages.append(HumanMessage(content=msg.content))
-                else:
-                    messages.append(AIMessage(content=msg.content))
+        # Check for common confirmations
+        if any(word in message_lower for word in ['yes', 'yeah', 'correct', 'right', 'sure']):
+            return "confirm"
             
-            # Add current message
-            messages.append(HumanMessage(content=message))
+        # Check for common rejections
+        if any(word in message_lower for word in ['no', 'nope', 'incorrect', 'wrong']):
+            return "reject"
             
-            # Get intent detection from chat model
-            response = await self.chat_model.ainvoke(messages)
+        # Check if in recommendation stage and mentioning specializations
+        if state.stage == "recommendation" and state.recommendations:
+            for rec in state.recommendations:
+                if rec.specialization.lower() in message_lower:
+                    return "explore_career_paths"
+                    
+        # If in profile collection stage, likely providing profile info
+        if state.stage == "profile_collection":
+            return "update_profile"
             
-            # Parse response as JSON
-            try:
-                intent_data = json.loads(response.content)
-                return intent_data.get("intent", "general_question"), intent_data.get("confidence", 0.5)
-            except json.JSONDecodeError:
-                logger.error("Failed to parse intent JSON")
-                return "general_question", 0.5
-                
-        except Exception as e:
-            logger.error(f"Error detecting intent: {str(e)}")
-            return "general_question", 0.5
+        # Default fallback
+        return "general_question"
 
-    async def _extract_specialization_mention(self, message: str, recommendations: list) -> Optional[str]:
+    async def _extract_specialization_mention(self, message: str, recommendations: List[Specialization]) -> Optional[str]:
         """Extract which specialization the user is interested in exploring"""
         try:
             # Try to parse by number
             for i in range(1, len(recommendations) + 1):
                 if str(i) in message:
-                    return recommendations[i-1]["specialization"]
+                    return recommendations[i-1].specialization
             
             # Try to match by name
             for rec in recommendations:
-                if rec["specialization"].lower() in message.lower():
-                    return rec["specialization"]
+                if rec.specialization.lower() in message.lower():
+                    return rec.specialization
             
             # Use LLM to find the specialization if direct matching fails
             system_prompt = """The user is responding to a list of specialization recommendations. 
-            Determine which specialization they are referring to in their message. 
+            Determine which specialization they are referring to in their message.
+            
             Available specializations:
             {}
             
-            Respond with ONLY the exact name of the specialization they're referring to, or "unknown" if you can't determine it."""
+            Return a structured response indicating the specialization name and your confidence in the extraction."""
             
-            spec_list = "\n".join([f"{i+1}. {rec['specialization']}" for i, rec in enumerate(recommendations)])
+            spec_list = "\n".join([f"{i+1}. {rec.specialization}" for i, rec in enumerate(recommendations)])
             prompt = system_prompt.format(spec_list)
             
             messages = [
@@ -322,13 +429,15 @@ class ConversationManager:
                 HumanMessage(content=message)
             ]
             
-            response = await self.chat_model.ainvoke(messages)
-            extracted = response.content.strip()
+            # Use structured output for specialization extraction
+            structured_llm = self.chat_model.with_structured_output(SpecializationExtraction)
+            result: SpecializationExtraction = await structured_llm.ainvoke(messages)
             
-            # Check if the extraction matches any recommendation
-            for rec in recommendations:
-                if rec["specialization"].lower() == extracted.lower():
-                    return rec["specialization"]
+            if result.specialization and result.confidence > 0.7:
+                # Verify the extracted specialization exists in recommendations
+                for rec in recommendations:
+                    if rec.specialization.lower() == result.specialization.lower():
+                        return rec.specialization
             
             return None
             
@@ -370,8 +479,8 @@ class ConversationManager:
                 return StudentProfile(
                     name="Anonymous",
                     academic_level="high_school",
-                    subjects=[],
-                    interests=[]
+                    subjects=[Subject(name="General Studies", is_favorite=True)],
+                    interests=["General Studies"]
                 )
         else:
             try:
@@ -381,8 +490,28 @@ class ConversationManager:
                 # Only update fields with new information
                 for field, value in extracted_info.items():
                     if value:  # Only update if value is not empty
-                        if field in ["subjects", "interests", "certifications", "extracurriculars", "career_inclinations", "strengths"]:
-                            # For list fields, merge existing with new values
+                        if field == "subjects":
+                            # For subjects, merge based on subject names to avoid duplicates
+                            existing_subjects = {s["name"]: s for s in updated_info.get("subjects", [])}
+                            for new_subject in value:
+                                subject_name = new_subject["name"] if isinstance(new_subject, dict) else new_subject.name
+                                if subject_name in existing_subjects:
+                                    # Update existing subject if new one has more information
+                                    existing_subject = existing_subjects[subject_name]
+                                    if isinstance(new_subject, dict):
+                                        if new_subject.get("grade"):
+                                            existing_subject["grade"] = new_subject["grade"]
+                                        if new_subject.get("is_favorite"):
+                                            existing_subject["is_favorite"] = new_subject["is_favorite"]
+                                else:
+                                    # Add new subject
+                                    if isinstance(new_subject, dict):
+                                        existing_subjects[subject_name] = new_subject
+                                    else:
+                                        existing_subjects[subject_name] = new_subject.dict()
+                            updated_info["subjects"] = list(existing_subjects.values())
+                        elif field in ["interests", "certifications", "extracurriculars", "career_inclinations", "strengths", "challenges"]:
+                            # For simple list fields, merge using sets
                             current_values = set(updated_info.get(field, []))
                             new_values = set(value)
                             updated_info[field] = list(current_values.union(new_values))
@@ -509,7 +638,7 @@ Interests: {', '.join(profile.interests)}
 
         return summary
 
-    async def _format_recommendations(self, recommendations: list) -> str:
+    async def _format_recommendations(self, recommendations: List[Specialization]) -> str:
         """Format recommendations for user presentation"""
         if not recommendations:
             return "I apologize, but I couldn't generate any recommendations at this time. Please try again."
@@ -517,10 +646,10 @@ Interests: {', '.join(profile.interests)}
         response = "Based on your profile, I recommend these university specializations:\n\n"
 
         for i, rec in enumerate(recommendations, 1):
-            response += f"{i}. {rec['specialization']}\n"
-            response += f"   Reasoning: {rec['reasoning']}\n"
-            response += f"   Key Subjects: {', '.join(rec['key_subjects'])}\n"
-            response += f"   Potential Careers: {', '.join(rec['career_prospects'])}\n\n"
+            response += f"{i}. {rec.specialization}\n"
+            response += f"   Reasoning: {rec.reasoning}\n"
+            response += f"   Key Subjects: {', '.join(rec.key_subjects)}\n"
+            response += f"   Potential Careers: {', '.join(rec.career_prospects)}\n\n"
 
         response += "Which specialization would you like to explore further? (Respond with the number or name, or ask me about career paths for any of these options)"
 
@@ -530,48 +659,50 @@ Interests: {', '.join(profile.interests)}
         """Process career path exploration request - enhanced to handle both string message and direct specialization"""
         try:
             # If message is a direct specialization name
-            if isinstance(message, str) and any(rec["specialization"] == message for rec in state.recommendations):
+            if isinstance(message, str) and any(rec.specialization == message for rec in state.recommendations):
                 specialization = message
             else:
-                # Try to parse which specialization the user wants to explore from a message
-                try:
-                    # First try by number
-                    selection = int(message.strip()[0]) - 1
-                    specialization = state.recommendations[selection]["specialization"]
-                except:
-                    # If parsing fails, try to match specialization by name
-                    specialization = None
-                    for rec in state.recommendations:
-                        if rec["specialization"].lower() in message.lower():
-                            specialization = rec["specialization"]
-                            break
-                    
-                    if not specialization:
-                        # Use LLM to extract specialization
-                        extracted = await self._extract_specialization_mention(message, state.recommendations)
-                        if extracted:
-                            specialization = extracted
-                        else:
-                            return "I'm not sure which specialization you're interested in. Could you specify by number (1, 2, etc.) or name?"
+                # Try to extract which specialization the user wants to explore
+                specialization = await self._extract_specialization_mention(message, state.recommendations)
+                if not specialization:
+                    return "I'm not sure which specialization you're interested in. Could you specify by number (1, 2, etc.) or name?"
 
             # Update selected specialization in state
             state.selected_specialization = specialization
             
-            # Get career paths for selected specialization
-            career_paths = await self.career_path_engine.get_career_paths(
-                specialization,
-                state.profile.dict()
-            )
-
+            # Create system prompt for career paths
+            system_prompt = f"""You are a university specialization advisor providing career path information.
+            Generate detailed career paths for the {specialization} specialization.
+            Consider the student's profile and interests when describing the paths.
+            
+            Student Profile:
+            {state.profile.dict()}
+            
+            Each career path must include:
+            - A specific career path name
+            - Detailed description of the role and responsibilities
+            - Required skills and competencies
+            - Typical career progression
+            - Required education and qualifications"""
+            
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"What are the career paths for {specialization}?")
+            ]
+            
+            # Get career paths using structured output
+            structured_llm = self.chat_model.with_structured_output(CareerPathList)
+            result: CareerPathList = await structured_llm.ainvoke(messages)
+            
             # Format response
             response = f"Here are some promising career paths for {specialization}:\n\n"
 
-            for path in career_paths:
-                response += f"• {path['career_path']}\n"
-                response += f"  Description: {path['description']}\n"
-                response += f"  Required Skills: {', '.join(path['required_skills'])}\n"
-                response += f"  Career Progression: {path['progression']}\n"
-                response += f"  Required Education: {', '.join(path['education'])}\n\n"
+            for path in result.career_paths:
+                response += f"• {path.career_path}\n"
+                response += f"  Description: {path.description}\n"
+                response += f"  Required Skills: {', '.join(path.required_skills)}\n"
+                response += f"  Career Progression: {path.progression}\n"
+                response += f"  Required Education: {', '.join(path.education)}\n\n"
 
             response += "Would you like to explore another specialization, get more details about any of these career paths, or update your profile information?"
 
@@ -581,9 +712,24 @@ Interests: {', '.join(profile.interests)}
             logger.error(f"Error processing career path request: {str(e)}")
             return "I apologize, but I had trouble processing your request for career paths. Could you please specify which specialization you're interested in?"
 
-    async def _generate_recommendations_with_context(self, state: ConversationState) -> List[Dict]:
+    async def _generate_recommendations_with_context(self, state: ConversationState) -> List[Specialization]:
         """Generate recommendations using chat history context"""
         try:
+            # Print detailed profile information before generating recommendations
+            logger.info(f"Generating recommendations for profile:\n{state.profile.dict()}")
+            
+            # Calculate and log profile completion percentage
+            completion = self.calculate_profile_completion(state)
+            logger.info(f"Profile completion: {completion}%")
+            
+            # Log missing fields
+            required_missing = self.get_missing_required_fields(state)
+            optional_missing = self.get_missing_optional_fields(state)
+            if required_missing:
+                logger.info(f"Missing required fields: {required_missing}")
+            if optional_missing:
+                logger.info(f"Missing optional fields: {optional_missing}")
+
             # Prepare messages with chat history context
             messages = []
             for msg in state.chat_history[-10:]:  # Use last 10 messages for context
@@ -594,7 +740,7 @@ Interests: {', '.join(profile.interests)}
 
             # Create system prompt for recommendations
             system_prompt = f"""You are a university specialization advisor. Based on the student's profile and conversation history, 
-            generate 3-4 university specialization recommendations in JSON format.
+            generate 3-4 university specialization recommendations.
             
             Student Profile:
             {state.profile.dict()}
@@ -607,35 +753,26 @@ Interests: {', '.join(profile.interests)}
             5. Make connections with their extracurricular activities
             6. Be specific with specializations - provide concrete degree programs, not general fields
             
-            Respond with a JSON array in this format:
-            [
-                {{
-                    "specialization": "Name of Specialization",
-                    "reasoning": "Detailed reasoning based on profile and conversation",
-                    "key_subjects": ["Subject1", "Subject2", "Subject3"],
-                    "career_prospects": ["Career1", "Career2", "Career3"]
-                }}
-            ]"""
+            Each recommendation must include:
+            - A specific specialization name
+            - Detailed reasoning based on the student's profile
+            - List of key subjects required for the specialization
+            - List of potential career prospects"""
             
             messages.insert(0, SystemMessage(content=system_prompt))
 
-            # Get recommendation from chat model
-            response = await self.chat_model.ainvoke(messages)
-
-            # Parse JSON response
-            try:
-                recommendations = json.loads(response.content)
-                if isinstance(recommendations, list):
-                    return recommendations
-            except json.JSONDecodeError:
-                logger.error("Failed to parse recommendations JSON")
-
-            # Fallback to regular recommendation engine
-            return await self.recommendation_engine.generate_recommendations(state.profile)
+            # Get recommendations using structured output
+            structured_llm = self.chat_model.with_structured_output(RecommendationList)
+            result: RecommendationList = await structured_llm.ainvoke(messages)
+            
+            return result.recommendations
 
         except Exception as e:
             logger.error(f"Error generating recommendations with context: {str(e)}")
-            return await self.fallback_recommendation_engine.generate_recommendations(state.profile)
+            # Fallback to regular recommendation engine
+            fallback_recs = await self.fallback_recommendation_engine.generate_recommendations(state.profile)
+            # Convert fallback recommendations to Specialization objects
+            return [Specialization(**rec) for rec in fallback_recs]
 
     async def _generate_dynamic_response(self, state: ConversationState, message: str) -> str:
         """Generate dynamic conversational response when we can't categorize the message"""
@@ -676,3 +813,74 @@ Interests: {', '.join(profile.interests)}
         except Exception as e:
             logger.error(f"Error generating dynamic response: {str(e)}")
             return "I'm here to help with your academic specialization questions. Could you tell me more about your academic interests or what you'd like to explore next?"
+
+    def calculate_profile_completion(self, state: ConversationState) -> float:
+        """Calculate profile completion percentage based on filled fields"""
+        if not state.profile:
+            return 0.0
+        
+        # Required fields are weighted more heavily (70%)
+        required_fields = {
+            'name': bool(state.profile.name and state.profile.name not in ["Student", "Anonymous Student"]),
+            'academic_level': bool(state.profile.academic_level),
+            'subjects': bool(state.profile.subjects and len(state.profile.subjects) > 0 and not all(s.name == "General Studies" for s in state.profile.subjects)),
+            'interests': bool(state.profile.interests and len(state.profile.interests) > 0 and "General Studies" not in state.profile.interests)
+        }
+        
+        # Optional fields contribute 30%
+        optional_fields = {
+            'age': bool(state.profile.age),
+            'certifications': bool(state.profile.certifications and len(state.profile.certifications) > 0),
+            'extracurriculars': bool(state.profile.extracurriculars and len(state.profile.extracurriculars) > 0),
+            'career_inclinations': bool(state.profile.career_inclinations and len(state.profile.career_inclinations) > 0),
+            'strengths': bool(state.profile.strengths and len(state.profile.strengths) > 0),
+            'challenges': bool(state.profile.challenges and len(state.profile.challenges) > 0)
+        }
+        
+        # Calculate scores
+        required_score = sum(required_fields.values()) * (70.0 / len(required_fields))
+        optional_score = sum(optional_fields.values()) * (30.0 / len(optional_fields))
+        
+        return required_score + optional_score
+
+    def get_missing_required_fields(self, state: ConversationState) -> List[str]:
+        """Return list of missing required fields"""
+        if not state.profile:
+            return ["name", "academic_level", "subjects", "interests"]
+        
+        missing = []
+        if not state.profile.name or state.profile.name in ["Student", "Anonymous Student"]:
+            missing.append("name")
+        if not state.profile.academic_level:
+            missing.append("academic_level")
+        if not state.profile.subjects or all(s.name == "General Studies" for s in state.profile.subjects):
+            missing.append("subjects")
+        if not state.profile.interests or "General Studies" in state.profile.interests:
+            missing.append("interests")
+        return missing
+
+    def get_missing_optional_fields(self, state: ConversationState) -> List[str]:
+        """Return list of missing optional fields"""
+        if not state.profile:
+            return ["age", "certifications", "extracurriculars", "career_inclinations", "strengths", "challenges"]
+        
+        missing = []
+        if not state.profile.age:
+            missing.append("age")
+        if not state.profile.certifications:
+            missing.append("certifications")
+        if not state.profile.extracurriculars:
+            missing.append("extracurriculars")
+        if not state.profile.career_inclinations:
+            missing.append("career_inclinations")
+        if not state.profile.strengths:
+            missing.append("strengths")
+        if not state.profile.challenges:
+            missing.append("challenges")
+        return missing
+
+    def is_profile_complete_enough(self, state: ConversationState) -> bool:
+        """Check if profile is complete enough to proceed with recommendations"""
+        completion = self.calculate_profile_completion(state)
+        required_fields_missing = self.get_missing_required_fields(state)
+        return completion >= 70.0 and not required_fields_missing
