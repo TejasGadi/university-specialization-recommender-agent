@@ -47,9 +47,55 @@ class ConversationManager:
             api_key=settings.OPENAI_API_KEY
         )
 
-    async def process_message(self, session_id: str, message: str) -> str:
-        """Process incoming message and return response within time constraint"""
+    async def _stream_response(self, text: str, websocket) -> None:
+        """Helper method to stream response to the websocket with improved error handling"""
+        if not websocket:
+            return
+            
         try:
+            # Split text into sentences and stream each one
+            sentences = text.split('. ')
+            current_text = ""
+            
+            for i, sentence in enumerate(sentences):
+                if not sentence.strip():
+                    continue
+                    
+                try:
+                    current_text += sentence.strip()
+                    
+                    # Send the current chunk
+                    await websocket.send_json({
+                        "type": "stream",
+                        "content": current_text
+                    })
+                    
+                    # Add period and space after each sentence except the last one
+                    if i < len(sentences) - 1:
+                        current_text += ". "
+                    
+                    await asyncio.sleep(0.05)  # Reduced delay between sentences
+                    
+                except Exception as e:
+                    logger.error(f"Error sending stream chunk: {str(e)}")
+                    raise  # Re-raise to handle in outer try-catch
+            
+            # Send the final complete message
+            await websocket.send_json({
+                "type": "end_stream",
+                "content": text.strip()
+            })
+            
+        except Exception as e:
+            logger.error(f"Error in streaming response: {str(e)}", exc_info=True)
+            # Don't try to send error message - let the caller handle it
+            raise
+
+    async def process_message(self, session_id: str, message: str, websocket=None) -> str:
+        """Process incoming message and return response"""
+        try:
+            logger.info(f"Processing message for session {session_id}: {message}")
+            
             # Check rate limit
             await self.rate_limiter.check_rate_limit(session_id)
 
@@ -63,24 +109,12 @@ class ConversationManager:
             state.chat_history.append(Message(role="user", content=message))
 
             try:
-                # Calculate dynamic timeout based on message length and conversation stage
-                base_timeout = settings.MAX_RESPONSE_TIME
+                logger.info(f"Starting message processing for session {session_id} in stage: {state.stage}")
                 
-                # Increase timeout for longer messages
-                if len(message) > 200:
-                    base_timeout *= 1.5
-                if len(message) > 500:
-                    base_timeout *= 1.5
-                    
-                # Increase timeout for profile collection stage
-                if state.stage == "profile_collection":
-                    base_timeout *= 1.5
-                
-                # Process message with calculated timeout
-                response = await asyncio.wait_for(
-                    self._process_message_internal(state, message),
-                    timeout=base_timeout
-                )
+                # Process message without timeout
+                response = await self._process_message_internal(state, message, websocket)
+
+                logger.info(f"Generated response for session {session_id}: {response[:100]}...")
 
                 # Add assistant response to chat history
                 state.chat_history.append(Message(role="assistant", content=response))
@@ -91,50 +125,21 @@ class ConversationManager:
 
                 return response
 
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Request timed out for session {session_id}. "
-                    f"Message length: {len(message)}, Stage: {state.stage}"
-                )
-                
-                # Provide stage-specific timeout messages
-                if state.stage == "profile_collection":
-                    error_msg = (
-                        "I see you're sharing detailed information about your background. "
-                        "Let me help you break this down: Could you first tell me about "
-                        "your current academic level and 2-3 of your favorite subjects?"
-                    )
-                elif state.stage == "recommendation":
-                    error_msg = (
-                        "I need a bit more time to analyze your preferences and generate "
-                        "personalized recommendations. Could you confirm if you want to "
-                        "see recommendations based on your current profile?"
-                    )
-                else:
-                    error_msg = (
-                        "I need a moment to process your detailed response. "
-                        "Could you break it down into smaller parts? "
-                        "Let's tackle one aspect at a time."
-                    )
-                
-                state.chat_history.append(Message(role="assistant", content=error_msg))
-                return error_msg
-
             except Exception as e:
                 logger.error(f"Error in process_message: {str(e)}", exc_info=True)
                 error_msg = (
                     "I encountered an issue processing your response. "
-                    "Could you try again with more focused information? "
-                    "For example, tell me about one aspect at a time."
+                    "Could you try again? I'll take as much time as needed to process it properly."
                 )
+                
                 state.chat_history.append(Message(role="assistant", content=error_msg))
                 return error_msg
 
         except Exception as e:
             logger.error(f"Critical error in process_message for session {session_id}: {str(e)}", exc_info=True)
-            return "I apologize, but I encountered a system error. Please try again in a moment."
+            return "I apologize, but I encountered a system error. Please try again."
 
-    async def _process_message_internal(self, state: ConversationState, message: str) -> str:
+    async def _process_message_internal(self, state: ConversationState, message: str, websocket=None) -> str:
         """Enhanced internal message processing with dynamic flow"""
         
         # First-time welcome message

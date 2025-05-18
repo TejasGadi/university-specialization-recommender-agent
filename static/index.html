@@ -139,70 +139,124 @@
     <script>
         // Generate a random session ID
         const sessionId = Math.random().toString(36).substring(7);
-        const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
+        let ws = null;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+        const RECONNECT_DELAY = 1000; // Start with 1 second delay
+        
         const messagesContainer = document.getElementById('chat-messages');
         const messageInput = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
         const typingIndicator = document.getElementById('typing-indicator');
-
-        ws.onmessage = function(event) {
-            const response = JSON.parse(event.data);
+        
+        function connectWebSocket() {
+            ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
             
-            if (response.type === 'status') {
-                if (response.content === 'typing') {
-                    typingIndicator.style.display = 'block';
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                } else if (response.content === 'idle') {
-                    typingIndicator.style.display = 'none';
+            ws.onopen = function() {
+                console.log('Connected to server');
+                reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+                messageInput.disabled = false;
+                sendButton.disabled = false;
+            };
+            
+            ws.onmessage = function(event) {
+                const response = JSON.parse(event.data);
+                
+                if (response.type === 'status') {
+                    if (response.content === 'typing') {
+                        typingIndicator.style.display = 'block';
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    } else if (response.content === 'idle') {
+                        typingIndicator.style.display = 'none';
+                        messageInput.disabled = false;
+                        sendButton.disabled = false;
+                        messageInput.focus();
+                    }
+                } else if (response.type === 'message' || response.type === 'stream') {
+                    addMessage(response.content, 'bot');
+                } else if (response.type === 'error') {
+                    addMessage(response.content, 'error');
+                    messageInput.disabled = false;
+                    sendButton.disabled = false;
                 }
-            } else if (response.type === 'message') {
-                addMessage(response.content, 'bot');
-            } else if (response.type === 'error') {
-                addMessage(response.content, 'error');
-            }
-        };
-
-        ws.onerror = function(error) {
-            addMessage('Error connecting to server', 'error');
-        };
-
+                
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                addMessage('Error connecting to server', 'error');
+            };
+            
+            ws.onclose = function(event) {
+                console.log('Connection closed:', event.code, event.reason);
+                messageInput.disabled = true;
+                sendButton.disabled = true;
+                
+                // Only attempt to reconnect if we haven't exceeded max attempts
+                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    const delay = Math.min(RECONNECT_DELAY * Math.pow(2, reconnectAttempts), 10000);
+                    console.log(`Attempting to reconnect in ${delay}ms...`);
+                    
+                    setTimeout(() => {
+                        reconnectAttempts++;
+                        connectWebSocket();
+                    }, delay);
+                } else {
+                    addMessage('Connection lost. Please refresh the page to reconnect.', 'error');
+                }
+            };
+        }
+        
         function addMessage(content, type) {
             const messageDiv = document.createElement('div');
             messageDiv.classList.add('message');
             messageDiv.classList.add(type + '-message');
             messageDiv.textContent = content;
-            // Insert before typing indicator
-            messagesContainer.insertBefore(messageDiv, typingIndicator);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            
+            // Find existing message with same content
+            const existingMessages = messagesContainer.getElementsByClassName(type + '-message');
+            let isDuplicate = false;
+            
+            for (let i = existingMessages.length - 1; i >= 0; i--) {
+                if (existingMessages[i].textContent === content) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            
+            // Only add if not a duplicate
+            if (!isDuplicate) {
+                // Insert before typing indicator
+                messagesContainer.insertBefore(messageDiv, typingIndicator);
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }
         }
-
+        
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (message && ws.readyState === WebSocket.OPEN) {
+            if (message && ws && ws.readyState === WebSocket.OPEN) {
                 addMessage(message, 'user');
                 ws.send(message);
                 messageInput.value = '';
                 // Disable input and button while processing
                 messageInput.disabled = true;
                 sendButton.disabled = true;
+            } else if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addMessage('Connection lost. Attempting to reconnect...', 'error');
+                connectWebSocket();
             }
         }
-
+        
         messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
                 sendMessage();
             }
         });
-
-        // Re-enable input when bot becomes idle
-        ws.addEventListener('message', function(event) {
-            const response = JSON.parse(event.data);
-            if (response.type === 'status' && response.content === 'idle') {
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                messageInput.focus();
-            }
-        });
+        
+        // Initial connection
+        connectWebSocket();
     </script>
 </body>
 </html> 
