@@ -302,7 +302,7 @@ Analyze the message and determine the primary intent. Consider:
             # User wants to explore career paths for a specialization
             state.stage = "career_paths"
             # Try to extract which specialization they're interested in
-            specialization = await self._extract_specialization_mention(message, state.recommendations)
+            specialization = self._extract_specialization_mention(message, state.recommendations)
             if specialization:
                 return await self._process_career_path_request(state, specialization)
             else:
@@ -385,7 +385,7 @@ Analyze the message and determine the primary intent. Consider:
         # Default fallback
         return "general_question"
 
-    async def _extract_specialization_mention(self, message: str, recommendations) -> Optional[str]:
+    def _extract_specialization_mention(self, message: str, recommendations) -> Optional[str]:
         """Extract which specialization the user is interested in exploring"""
         try:
             # # Handle case where recommendations is a string
@@ -401,9 +401,11 @@ Analyze the message and determine the primary intent. Consider:
             #     if isinstance(rec, Specialization):
             #         if rec.specialization.lower() in message.lower():
             #             return rec.specialization
+
+            logger.info(f"Started _extract_specialization_mention")
                 
             # Use LLM to find the specialization if direct matching fails
-            system_prompt = f"""The user is responding to a list of specialization recommendations. 
+            system_prompt = """The user is responding to a list of specialization recommendations. 
             Determine which specialization they are referring to in their message.
             
             Available specializations:
@@ -411,19 +413,24 @@ Analyze the message and determine the primary intent. Consider:
             
             Return a structured response indicating the specialization name and your confidence in the extraction."""
             
-            if isinstance(recommendations, list):
-                spec_list = "\n".join([f"{i+1}. {rec.specialization}" for i, rec in enumerate(recommendations) if isinstance(rec, Specialization)])
-            else:
-                spec_list = recommendations
+            # if isinstance(recommendations, list):
+            #     spec_list = "\n".join([f"{i+1}. {rec.specialization}" for i, rec in enumerate(recommendations) if isinstance(rec, Specialization)])
+            # else:
+            #     spec_list = recommendations
+
+            # spec_list = recommendations
                 
-            prompt = system_prompt.format(spec_list)
+            prompt = system_prompt.format(recommendations=recommendations)
+
+            logger.info(f"prompt: {prompt}")
             
             messages = [
                 SystemMessage(content=prompt),
                 HumanMessage(content=message)
             ]
-            
-            result = await self.chat_model.ainvoke(messages)
+            logger.info(f"Before calling chat invoke")
+            result = self.chat_model.invoke(messages)
+            logger.info(f"Extraction result: {result}")
             
             return result.content
             
@@ -640,7 +647,7 @@ Interests: {', '.join(profile.interests)}
             response += f"   Key Subjects: {', '.join(rec.key_subjects)}\n"
             response += f"   Potential Careers: {', '.join(rec.career_prospects)}\n\n"
 
-        response += "Which specialization would you like to explore further? (Respond with the number or name, or ask me about career paths for any of these options)"
+        response += "Which specialization would you like to explore further? (Respond with the name, or ask me about career paths in this specialization)"
 
         return response
 
@@ -657,10 +664,10 @@ Interests: {', '.join(profile.interests)}
                     specialization = message
                 else:
                     # Try to extract which specialization the user wants to explore
-                    specialization = await self._extract_specialization_mention(message, state.recommendations)
+                    specialization = self._extract_specialization_mention(message, state.recommendations)
             else:
                 # Handle string recommendations
-                specialization = await self._extract_specialization_mention(message, state.recommendations)
+                specialization = self._extract_specialization_mention(message, state.recommendations)
                 
             if not specialization:
                 logger.info("No specialization could be extracted from the message")
@@ -674,14 +681,18 @@ Interests: {', '.join(profile.interests)}
             try:
                 # Create system prompt for career paths
                 system_prompt = f"""You are a university specialization advisor providing career path information.
-                Generate detailed career paths for the {specialization} specialization.
-                
-                Each career path must include:
-                - A specific career path name
-                - Detailed description of the role and responsibilities
-                - Required skills and competencies
-                - Typical career progression
-                - Required education and qualifications"""
+Generate career paths for the specialization "{specialization}".
+
+Each career path must include:
+- A short name of the role (e.g., Software Developer)
+- A concise description of what the role involves
+- Key required skills (max 4)
+- Career progression path
+- Typical education/qualifications (1-2 lines max)
+
+Avoid long paragraphs. Each section must be brief and direct. No markdown formatting. Output must be in plain text with good spacing.
+"""
+
                 
                 messages = [
                     SystemMessage(content=system_prompt),
@@ -754,11 +765,11 @@ Interests: {', '.join(profile.interests)}
 
             payload = {
                 "instruction": (
-                    "You are a college/university specialization recommender. Analyze the student's profile and recommend suitable university "
-                    "specializations, with reasons and career prospects."
+                    "You are a career counselor."
+                    "Analyze the student's profile and recommend suitable university specializations, with reasons and career prospects."
                 ),
                 "input_text": input_text,
-                "max_new_tokens": 256
+                "max_new_tokens": 128
             }
 
             logger.info(f"Sending API request with payload:\n{payload}")
@@ -766,7 +777,7 @@ Interests: {', '.join(profile.interests)}
 
             async with httpx.AsyncClient() as client:
                 try:
-                    response = await client.post(api_url, json=payload)
+                    response = await client.post(api_url, json=payload, timeout=30)
                     logger.info(f"API Response status: {response.status_code}")
                     logger.info(f"API Response headers: {response.headers}")
                     logger.info(f"API Response body: {response.text}")
